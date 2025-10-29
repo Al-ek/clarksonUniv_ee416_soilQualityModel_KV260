@@ -1,111 +1,145 @@
 import torch
-import torchvision
-import torch.nn.functional as F
+import torch.nn as nn
 import torch.optim as optim
-
-from tqdm import tqdm
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
-from common import *
+import torchvision.transforms as transforms
+import timm
 
 import os
-import sys
 import argparse
 import shutil
 
-DATA_DIR = "data"
-DIVIDER = "<><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>"
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from torchvision.datasets import ImageFolder
+from torchvision import models
+
+#
+DATA_DIR = 'data'
+BATCHSIZE = 32
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS = 100
+BUILD_DIR = 'build'
 
+class soilQualityDataset(Dataset):
+        def __init__(self, data_dir, transform=None):
+            self.data = ImageFolder(data_dir, transform=transform)
+
+        def __len__(self):
+            return len(self.data)
+
+        def __getitem__(self, idx):
+            return self.data[idx]
+        
+        def classes(self):
+            return self.data.classes
+        
+class soilQualityClassifier(nn.Module):
+        def __init__(self, num_classes=2):
+            super(soilQualityClassifier, self).__init__()
+            self.base_model = timm.create_model('resnet18', pretrained=True)
+            self.features = nn.Sequential(*list(self.base_model.children())[:-1])
+
+            resnet_out_size = 512
+
+            self.classifier = nn.Linear(resnet_out_size, num_classes)
+
+        def forward(self, x):
+            x = self.features(x)
+            output = self.classifier(x)
+            return output
+
+def train(epochs):        
+
+    # Transform images to 128,128 and transform into a tensor
+    transform = transforms.Compose([transforms.Resize((224,224)), transforms.ToTensor()])
+
+
+    train_dataset = soilQualityDataset(DATA_DIR + '/train/', transform=transform)
+    val_dataset = soilQualityDataset(DATA_DIR + '/val/', transform=transform)
+
+    # Dataloader
+    train_loader = DataLoader(train_dataset, batch_size=BATCHSIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCHSIZE, shuffle=False)
+
+    # Create Pytorch Model
     
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
 
-val_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
+    model = soilQualityClassifier(num_classes=2)
+    model.to(DEVICE)
 
-def trainMethod(build_dir, batchsize, learnrate, epochs):
+    # training loop
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    float_model = build_dir + '/float_model'
+    train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
 
-    train_dataset = datasets.ImageFolder(os.path.join(DATA_DIR, "train"), transform=train_transform)
-    val_dataset = datasets.ImageFolder(os.path.join(DATA_DIR, "val"), transform=val_transform)
+    for epoch in range(epochs):
 
-    
-    train_loader = DataLoader(train_dataset, batch_size=batchsize, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batchsize, shuffle=False, num_workers=2)
-    
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-    classes = train_dataset.classes
-    num_classes = len(classes)
-    print(f"Detected {num_classes} soil classes: {classes}")
+        for images, labels in tqdm(train_loader, desc='Train loop'):
 
-    # Load pre-trained ResNet18
-    model = models.resnet18(pretrained=True)
+            images, labels = images.to(DEVICE), labels.to(DEVICE) 
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * images.size(0)
 
-    # Replace the final fully-connected layer
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+            _, preds = torch.max(outputs, 1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
 
-    # Move to GPU (if available)
-    model = model.to(DEVICE)
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
+        train_acc = correct / total
+        train_accuracies.append(train_acc)
 
-    optimizer = optim.Adam(model.parameters(), lr=learnrate)
+        # Validation phase
+        model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-    # training with test after each epoch
-    for epoch in range(1, epochs + 1):
-        train(model, DEVICE, train_loader, optimizer, epoch)
-        test(model, DEVICE, val_loader)
+        with torch.no_grad():
 
+            for images, labels in tqdm(val_loader, desc='Validation loop'):
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                running_loss += loss.item() * images.size(0)
 
-    # save the trained model
-    shutil.rmtree(float_model, ignore_errors=True)    
-    os.makedirs(float_model)   
-    save_path = os.path.join(float_model, 'f_model.pth')
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+
+        val_loss = running_loss / len(val_loader.dataset)
+        val_losses.append(val_loss)
+        val_acc = correct / total
+        val_accuracies.append(val_acc)
+
+        print(f"[Epoch {epoch+1}/{epochs}] "
+            f"\nTrain loss: {train_loss}, Training accuracy: {train_acc*100:.2f}% "
+            f"\nValidation loss {val_loss}, Validation accuracy: {val_acc*100:.2f}% ") 
+
+    # Export float model to build directory
+    shutil.rmtree(BUILD_DIR + '/floatModel', ignore_errors=True)    
+    os.makedirs(BUILD_DIR + '/floatModel')   
+    save_path = os.path.join(BUILD_DIR + '/floatModel', 'soilQualiy_floatModel.pth')
     torch.save(model.state_dict(), save_path) 
     print('Trained model written to',save_path)
 
-    return
-
-
-    
 
 def main():
-    # construct the argument parser and parse the arguments
     ap = argparse.ArgumentParser()
-    ap.add_argument('-d', '--build_dir',   type=str,  default='build',       help='Path to build folder. Default is build')
-    ap.add_argument('-b', '--batchsize',   type=int,  default=100,           help='Training batchsize. Must be an integer. Default is 100')
-    ap.add_argument('-e', '--epochs',      type=int,  default=3,             help='Number of training epochs. Must be an integer. Default is 3')
-    ap.add_argument('-lr','--learnrate',   type=float,default=0.001,         help='Optimizer learning rate. Must be floating-point value. Default is 0.001')
+    ap.add_argument('-e',  '--num_epochs', type=int, default=5)
     args = ap.parse_args()
-
-    print('\n'+DIVIDER)
-    print('PyTorch version : ',torch.__version__)
-    print(sys.version)
-    print(DIVIDER)
-    print(' Command line options:')
-    print ('--build_dir    : ',args.build_dir)
-    print ('--batchsize    : ',args.batchsize)
-    print ('--learnrate    : ',args.learnrate)
-    print ('--epochs       : ',args.epochs)
-    print(DIVIDER)
-
-    # call train method
-
-    trainMethod(args.build_dir, args.batchsize, args.learnrate, args.epochs) 
-
+    train(args.num_epochs)
     return
-
 
 if __name__ == "__main__":
     main()
